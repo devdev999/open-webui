@@ -238,6 +238,11 @@ def convert_anthropic_to_openai_payload(anthropic_payload: dict) -> dict:
             else:
                 openai_payload[param] = anthropic_payload[param]
 
+    # Request usage data in streaming responses so token counts are available
+    # for the Anthropic message_delta event
+    if openai_payload.get('stream'):
+        openai_payload['stream_options'] = {'include_usage': True}
+
     # Tools conversion: Anthropic → OpenAI
     if 'tools' in anthropic_payload:
         openai_tools = []
@@ -349,8 +354,12 @@ async def openai_stream_to_anthropic_stream(openai_stream_generator, model: str 
     import uuid as _uuid
 
     msg_id = f'msg_{_uuid.uuid4().hex[:24]}'
-    input_tokens = 0
-    output_tokens = 0
+    usage_acc = {
+        'prompt_tokens': 0,
+        'completion_tokens': 0,
+        'cache_creation_input_tokens': 0,
+        'cache_read_input_tokens': 0,
+    }
     stop_reason = 'end_turn'
 
     # Track content blocks with a running index.
@@ -401,21 +410,18 @@ async def openai_stream_to_anthropic_stream(openai_stream_generator, model: str 
                 except (json.JSONDecodeError, TypeError):
                     continue
 
+                # Update accumulated usage from any chunk that carries it
+                if data.get('usage'):
+                    for k in usage_acc:
+                        if data['usage'].get(k) is not None:
+                            usage_acc[k] = data['usage'][k]
+
                 choices = data.get('choices', [])
                 if not choices:
-                    # Check for usage in the final chunk
-                    if data.get('usage'):
-                        input_tokens = data['usage'].get('prompt_tokens', input_tokens)
-                        output_tokens = data['usage'].get('completion_tokens', output_tokens)
                     continue
 
                 delta = choices[0].get('delta', {})
                 finish_reason = choices[0].get('finish_reason')
-
-                # Update usage if present
-                if data.get('usage'):
-                    input_tokens = data['usage'].get('prompt_tokens', input_tokens)
-                    output_tokens = data['usage'].get('completion_tokens', output_tokens)
 
                 # --- Handle text content ---
                 content = delta.get('content')
@@ -511,14 +517,22 @@ async def openai_stream_to_anthropic_stream(openai_stream_generator, model: str 
         block_stop = {'type': 'content_block_stop', 'index': block_index}
         yield f'event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n'.encode()
 
-    # Emit message_delta with stop reason
+    # Emit message_delta with stop reason and usage.
+    # OpenAI prompt_tokens is inclusive of cache tokens; Anthropic input_tokens is not.
+    # Subtract to avoid double-counting.
+    cache_tokens = usage_acc['cache_creation_input_tokens'] + usage_acc['cache_read_input_tokens']
     message_delta = {
         'type': 'message_delta',
         'delta': {
             'stop_reason': stop_reason,
             'stop_sequence': None,
         },
-        'usage': {'output_tokens': output_tokens},
+        'usage': {
+            'input_tokens': max(0, usage_acc['prompt_tokens'] - cache_tokens),
+            'output_tokens': usage_acc['completion_tokens'],
+            'cache_creation_input_tokens': usage_acc['cache_creation_input_tokens'],
+            'cache_read_input_tokens': usage_acc['cache_read_input_tokens'],
+        },
     }
     yield f'event: message_delta\ndata: {json.dumps(message_delta)}\n\n'.encode()
 
